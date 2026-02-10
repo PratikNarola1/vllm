@@ -680,8 +680,14 @@ class OpenAIServingChat(OpenAIServing):
             added_content_delta_arr = [False] * num_choices
             reasoning_end_arr = [False] * num_choices
             prompt_is_reasoning_end_arr: list[bool | None] = [None] * num_choices
+            # Track accumulated reasoning for fallback copy to content
+            accumulated_reasoning_arr: list[str] = [""] * num_choices
+            # Track if any content has been streamed
+            seen_content_arr: list[bool] = [False] * num_choices
         else:
             all_previous_token_ids = None
+            accumulated_reasoning_arr = None
+            seen_content_arr = None
 
         try:
             if self.reasoning_parser:
@@ -1139,6 +1145,35 @@ class OpenAIServingChat(OpenAIServing):
                             current_token_ids,
                             output.token_ids,
                         )
+                        
+                        # Check if reasoning has ended (e.g., </think> token seen)
+                        # This handles the case where the end token is a single
+                        # token and extract_reasoning_streaming returns None
+                        if (
+                            not reasoning_end_arr[i]
+                            and reasoning_parser.is_reasoning_end(
+                                as_list(output.token_ids)
+                            )
+                        ):
+                            reasoning_end_arr[i] = True
+                            # If content was extracted, mark it as seen
+                            if delta_message and delta_message.content:
+                                seen_content_arr[i] = True
+
+                        # After reasoning ends, subsequent deltas should be
+                        # content, not reasoning. Convert reasoning delta to
+                        # content delta since we're past </think>
+                        if (
+                            reasoning_end_arr[i]
+                            and delta_message
+                            and delta_message.reasoning
+                            and not delta_message.content
+                        ):
+                            delta_message.content = delta_message.reasoning
+                            delta_message.reasoning = None
+                            if seen_content_arr is not None:
+                                seen_content_arr[i] = True
+
                     # handle streaming just a content delta
                     else:
                         delta_message = DeltaMessage(content=delta_text)
@@ -1173,6 +1208,16 @@ class OpenAIServingChat(OpenAIServing):
                         ):
                             continue
                         delta_message = DeltaMessage()
+
+                    # Track reasoning and content for fallback copy
+                    if self.reasoning_parser and delta_message is not None:
+                        if (
+                            accumulated_reasoning_arr is not None
+                            and delta_message.reasoning
+                        ):
+                            accumulated_reasoning_arr[i] += delta_message.reasoning
+                        if seen_content_arr is not None and delta_message.content:
+                            seen_content_arr[i] = True
 
                     # Log streaming delta if output logging is enabled
                     if self.enable_log_outputs and self.request_logger:
@@ -1277,6 +1322,27 @@ class OpenAIServingChat(OpenAIServing):
                             delta_message = self._create_remaining_args_delta(
                                 delta_message, remaining_call, index
                             )
+
+                        # If no content was ever sent, no tools were called,
+                        # and we have accumulated reasoning, set content to
+                        # reasoning for the final chunk. This handles the case
+                        # where the model generates reasoning without a closing
+                        # </think> tag, putting all output in reasoning.
+                        if (
+                            self.reasoning_parser
+                            and accumulated_reasoning_arr is not None
+                            and seen_content_arr is not None
+                            and not seen_content_arr[i]
+                            and not tools_streamed[i]
+                            and not (self.use_harmony and harmony_tools_streamed[i])
+                            and not auto_tools_called
+                            and accumulated_reasoning_arr[i]
+                        ):
+                            # Copy accumulated reasoning to content
+                            if delta_message is None:
+                                delta_message = DeltaMessage()
+                            delta_message.content = accumulated_reasoning_arr[i]
+                            seen_content_arr[i] = True  # Prevent re-emission
 
                         # Send the finish response for each request.n only once
                         # In OpenAI's API, when a tool is called, the
@@ -1534,6 +1600,20 @@ class OpenAIServingChat(OpenAIServing):
                 enable_auto_tools=self.enable_auto_tools,
                 tool_parser_cls=self.tool_parser,
             )
+
+            # Copy reasoning to content if:
+            # - content is None or empty
+            # - reasoning has actual content
+            # - no tool calls were detected
+            # This handles the case where the model generates reasoning
+            # without a closing </think> tag, putting all output in reasoning.
+            if (
+                not content  # content is None or empty string
+                and reasoning  # reasoning has actual content
+                and not tool_calls  # no tool calls
+            ):
+                content = reasoning
+
             tool_call_class = (
                 MistralToolCall if isinstance(tokenizer, MistralTokenizer) else ToolCall
             )

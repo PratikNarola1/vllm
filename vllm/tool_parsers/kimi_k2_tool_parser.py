@@ -41,9 +41,9 @@ class KimiK2ToolParser(ToolParser):
         self.token_buffer: str = ""
         # Buffer size: empirical worst-case for longest marker (~30 chars) * 2
         # + safety margin for unicode + partial overlap. Prevents unbounded growth.
-        self.buffer_max_size: int = 1024
+        self.buffer_max_size: int = 131072
         self.section_char_count: int = 0  # Track characters processed in tool section
-        self.max_section_chars: int = 8192  # Force exit if section exceeds this
+        self.max_section_chars: int = 131072  # Force exit if section exceeds this
         self._buffer_overflow_logged: bool = False  # Log overflow once per session
 
         # Support both singular and plural variants
